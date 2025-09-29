@@ -1,0 +1,31 @@
+[project]
+name = "vtuber-qlora"
+version = "0.1.0"
+description = "QLoRA fine-tuning workflow for Qwen using vtuber knowledge base"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "mwparserfromhell",
+    "beautifulsoup4",
+    "tqdm",
+    "pandas",
+    "transformers>=4.43",
+    "datasets>=2.19",
+    "accelerate>=0.33",
+    "peft>=0.11.1",
+    "bitsandbytes>=0.43",
+    "trl>=0.9.6",
+    "huggingface-hub>=0.35.2",
+]
+
+[project.optional-dependencies]
+inference = ["vllm"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.uv]
+dev-dependencies = []
+
