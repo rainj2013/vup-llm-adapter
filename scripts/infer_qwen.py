@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-通用推理脚本：支持
+通用推理脚本（Qwen 家族可用）：
 1) 纯基座（不加 LoRA）
-2) 基座 + LoRA（PEFT）
+2) 基座 + LoRA（PEFT 方式）
 3) 合并后的全量模型（像普通 HF 模型一样加载）
 
-特性：
-- 优先本地缓存（local_files_only），可选 --offline_only / --force_online
-- dtype 兼容（Transformers 新版 dtype=，旧版自动回退 torch_dtype=）
-- 详细诊断：tokenizer_config/index.json 损坏时，打印本地文件路径与大小
+更新点：
+- 自动决定 do_sample：当 temperature>0 或 top_p<1.0 或 top_k>0 时启用采样
+- 仅在采样启用时传入 temperature/top_p/top_k，避免无效参数告警
+- 继续支持本地优先加载、dtype/torch_dtype 兼容、损坏文件诊断、离线/强制在线开关
 """
 
 import argparse
@@ -20,7 +20,7 @@ import sys
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ---------------- dtype 选择 & 兼容加载 ----------------
+# ---------------- dtype 选择 & from_pretrained 兼容 ----------------
 
 def pick_dtype(use_fp16: bool) -> torch.dtype:
     if torch.cuda.is_available() and use_fp16:
@@ -36,14 +36,10 @@ def from_pretrained_compat(cls, model_path, dtype, **kw):
         params["torch_dtype"] = dtype
     return cls.from_pretrained(model_path, **params)
 
-# ---------------- 诊断工具 ----------------
+# ---------------- 诊断工具：打印本地关键文件大小 ----------------
 
 def diag_local_files(model_id_or_path: str, names: list):
-    """
-    尝试定位本地缓存/目录中的关键文件，并打印大小，帮助识别 0 字节/HTML 被替换的文件。
-    """
     print("[DIAG] 检测本地关键文件：")
-    # 1) 如果是本地目录，直接检查
     if os.path.isdir(model_id_or_path):
         for name in names:
             p = os.path.join(model_id_or_path, name)
@@ -53,7 +49,6 @@ def diag_local_files(model_id_or_path: str, names: list):
                     print(f"       - {p} ({sz} bytes)")
                 except Exception:
                     print(f"       - {p} (无法获取大小)")
-    # 2) 缓存里（如果有 huggingface_hub）
     try:
         from huggingface_hub import hf_hub_download
         for name in names:
@@ -68,29 +63,22 @@ def diag_local_files(model_id_or_path: str, names: list):
         pass
     print("       如果看到 size=0 或明显异常，请删除该文件并重新下载。")
 
-# ---------------- 加载分词器（本地优先/联网回退/诊断） ----------------
+# ---------------- 分词器加载（本地优先/联网回退/诊断） ----------------
 
 def load_tokenizer(model_path: str, use_fast=True, trust_remote_code=True,
                    offline_only=False, force_online=False):
-    """
-    优先策略：
-      A) offline_only=True  -> 仅本地
-      B) force_online=True  -> 仅联网
-      C) 默认：先本地，失败再联网
-    """
     def _load(local_only: bool):
         return AutoTokenizer.from_pretrained(
             model_path, use_fast=use_fast, trust_remote_code=trust_remote_code,
             local_files_only=local_only
         )
 
-    # A) 仅本地
     if offline_only:
         try:
             tok = _load(local_only=True)
             print("[INFO] Tokenizer loaded (offline only).")
             return tok
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             print("\n[ERROR] tokenizer_config.json 解析失败（JSONDecodeError, offline only）。")
             diag_local_files(model_path, ["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json"])
             raise
@@ -99,21 +87,19 @@ def load_tokenizer(model_path: str, use_fast=True, trust_remote_code=True,
             diag_local_files(model_path, ["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json"])
             raise
 
-    # B) 强制联网
     if force_online:
         try:
             tok = _load(local_only=False)
             print("[INFO] Tokenizer loaded (force online).")
             return tok
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             print("\n[ERROR] tokenizer_config.json 解析失败（JSONDecodeError, online）。")
-            print("可能是镜像/代理返回了 HTML/空响应。建议切换网络或使用 HF 镜像/直连。")
+            print("可能是镜像/代理返回 HTML/空响应。建议切换网络或使用 HF 镜像/直连。")
             raise
         except Exception as e:
             print(f"[ERROR] 联网加载分词器失败：{e}")
             raise
 
-    # C) 默认：本地优先 -> 联网回退
     try:
         tok = _load(local_only=True)
         print("[INFO] Tokenizer loaded (local cache only).")
@@ -128,12 +114,10 @@ def load_tokenizer(model_path: str, use_fast=True, trust_remote_code=True,
             print("\n[ERROR] tokenizer_config.json 解析失败（JSONDecodeError）。")
             diag_local_files(model_path, ["tokenizer_config.json", "tokenizer.json", "special_tokens_map.json"])
             print("\n修复建议：\n"
-                  "  1) 若是本地目录，删除坏的 tokenizer_config.json 再重新下载该文件；\n"
-                  "  2) 若走缓存：\n"
-                  "     huggingface-cli scan-cache\n"
-                  "     huggingface-cli delete-cache --pattern '<模型名或部分关键字>'\n"
-                  "  3) 国内加速： export HF_ENDPOINT=https://hf-mirror.com\n"
-                  "  4) 完整离线： huggingface-cli download <repo> --local-dir ./models/<name> "
+                  "  1) 若本地目录损坏，删除坏文件后只重下该文件；\n"
+                  "  2) 若走缓存：huggingface-cli delete-cache --pattern '<模型名或关键字>'；\n"
+                  "  3) 国内加速：export HF_ENDPOINT=https://hf-mirror.com；\n"
+                  "  4) 完整离线再加载：huggingface-cli download <repo> --local-dir ./models/<name> "
                   "--local-dir-use-symlinks False --resume-download --force-download")
             raise
         except Exception as e_net:
@@ -144,9 +128,6 @@ def load_tokenizer(model_path: str, use_fast=True, trust_remote_code=True,
 
 def load_model(model_path: str, dtype: torch.dtype, peft_dir: str = None,
                trust_remote_code=True, offline_only=False, force_online=False):
-    """
-    同分词器加载策略；对 JSONDecodeError 做 index.json 诊断。
-    """
     def _load(local_only: bool):
         if peft_dir:
             from peft import PeftModel
@@ -163,7 +144,6 @@ def load_model(model_path: str, dtype: torch.dtype, peft_dir: str = None,
                 local_files_only=local_only
             )
 
-    # A) 仅本地
     if offline_only:
         try:
             m = _load(local_only=True); m.eval()
@@ -177,7 +157,6 @@ def load_model(model_path: str, dtype: torch.dtype, peft_dir: str = None,
             print(f"[ERROR] 本地加载模型失败：{e}")
             raise
 
-    # B) 强制联网
     if force_online:
         try:
             m = _load(local_only=False); m.eval()
@@ -190,7 +169,6 @@ def load_model(model_path: str, dtype: torch.dtype, peft_dir: str = None,
             print(f"[ERROR] 联网加载模型失败：{e}")
             raise
 
-    # C) 默认：本地优先 -> 联网回退
     try:
         m = _load(local_only=True); m.eval()
         print(f"[INFO] Loaded (local cache only): {model_path}" + (f" + {peft_dir}" if peft_dir else ""))
@@ -205,9 +183,9 @@ def load_model(model_path: str, dtype: torch.dtype, peft_dir: str = None,
             print("\n[ERROR] 模型索引 JSONDecodeError。")
             diag_local_files(model_path, ["model.safetensors.index.json", "pytorch_model.bin.index.json"])
             print("\n修复建议：\n"
-                  "  1) 若是本地目录，删除坏的 *.index.json 并重新下载；\n"
-                  "  2) 若走缓存，使用 huggingface-cli delete-cache 定向清理；\n"
-                  "  3) 建议先完整离线到 ./models/<name> 再 --model 指向本地目录；\n"
+                  "  1) 删除 0 字节/异常的 *.index.json 后只重下该文件；\n"
+                  "  2) delete-cache 定向清理；\n"
+                  "  3) 完整离线到 ./models/<name> 再加载；\n"
                   "  4) 国内可设置 HF_ENDPOINT=https://hf-mirror.com。")
             raise
         except Exception as e_net:
@@ -236,19 +214,18 @@ def main():
     ap.add_argument("--prompt", required=True, help="用户输入内容")
     ap.add_argument("--system", default="你是一个客观、简洁的中文助理。", help="可选：system 提示词")
     ap.add_argument("--max_new_tokens", type=int, default=256)
-    ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--top_p", type=float, default=0.95)
+    ap.add_argument("--temperature", type=float, default=0.0, help="事实问答建议 0 更稳定")
+    ap.add_argument("--top_p", type=float, default=1.0, help="与 temperature 搭配，采样时生效")
+    ap.add_argument("--top_k", type=int, default=0, help=">0 时启用 top-k 采样")
     ap.add_argument("--use_chat_template", action="store_true", help="使用 chat 模板（推荐）")
     ap.add_argument("--no_fp16", action="store_true", help="禁用 fp16/bf16，强制 float32")
-    # 新增：只离线/强制在线
     ap.add_argument("--offline_only", action="store_true", help="仅使用本地缓存/本地目录（不联网）")
     ap.add_argument("--force_online", action="store_true", help="跳过本地，强制联网加载（不建议常用）")
     args = ap.parse_args()
 
     if args.offline_only and args.force_online:
-        print("[ERROR] --offline_only 与 --force_online 不能同时使用。"); sys.exit(1)
-
-    dtype = pick_dtype(use_fp16=not args.no_fp16)
+        print("[ERROR] --offline_only 与 --force_online 不能同时使用。")
+        sys.exit(1)
 
     # 分词器
     tokenizer = load_tokenizer(
@@ -259,12 +236,13 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # 模型
+    dtype = pick_dtype(use_fp16=not args.no_fp16)
     model = load_model(
         args.model, dtype=dtype, peft_dir=args.peft_dir, trust_remote_code=True,
         offline_only=args.offline_only, force_online=args.force_online
     )
 
-    # 构造输入并生成
+    # 构造消息
     messages = []
     if args.system:
         messages.append({"role": "system", "content": args.system})
@@ -272,16 +250,25 @@ def main():
 
     inputs = build_inputs(tokenizer, messages, args.use_chat_template, model.device)
 
+    # 是否启用采样
+    use_sampling = (args.temperature > 0.0) or (args.top_p < 1.0) or (args.top_k > 0)
+
+    # 生成参数（仅在采样时传入 temperature/top_p/top_k）
+    gen_kwargs = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": use_sampling,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+    if use_sampling:
+        # 只在采样启用时才添加这些字段，避免无效参数告警
+        gen_kwargs["temperature"] = args.temperature if args.temperature > 0.0 else 1.0
+        gen_kwargs["top_p"] = args.top_p
+        if args.top_k > 0:
+            gen_kwargs["top_k"] = args.top_k
+
     with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        output_ids = model.generate(**inputs, **gen_kwargs)
 
     text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     print("\n===== MODEL OUTPUT =====\n")

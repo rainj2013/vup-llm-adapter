@@ -153,7 +153,7 @@ def main():
     def apply_chat_template(messages):
         try:
             return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
+                messages, tokenize=False, add_generation_prompt=True
             )
         except Exception:
             text = []
@@ -166,7 +166,8 @@ def main():
                     text.append(f"<|user|>\n{content}\n")
                 elif role == "assistant":
                     text.append(f"<|assistant|>\n{content}\n")
-            return "".join(text) + (tokenizer.eos_token or "")
+            text.append("<|assistant|>\n")
+            return "".join(text)
 
     # —— 兼容一维/二维的 labels 处理 —— #
     def preprocess(ex):
@@ -239,4 +240,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
